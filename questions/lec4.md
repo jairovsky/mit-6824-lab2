@@ -1,0 +1,3 @@
+### How does VM FT handle network partitions? That is, is it possible that if the primary and the backup end up in different network partitions that the backup will become a primary too and the system will run with two primaries? 
+
+They share an external storage that supports an operation similar to acquiring a lock. When one of the instances want to 'go live', they need first to acquire the lock on the shared storage. If the storage can't be reached, no progress is made.
