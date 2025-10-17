@@ -20,11 +20,12 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
+import "math/rand"
+import "os"
+import "time"
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -56,7 +57,26 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm    int32
+	votedFor       int8
+	log            []Log
+	volatile       Volatile
+	volatileLeader VolatileLeader
+}
 
+type Volatile struct {
+	commitIndex int32
+	lastApplied int32
+	nextDelayMs int32
+	raftState   RaftState
+}
+
+type VolatileLeader struct {
+	nextIndex  []int32
+	matchIndex []int32
+}
+
+type Log struct {
 }
 
 // return currentTerm and whether this server
@@ -85,7 +105,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -106,25 +125,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-}
-
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
 }
 
 //
@@ -168,7 +168,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -189,7 +188,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -234,10 +232,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+
+	rf.volatile.commitIndex = 0
+	rf.volatile.lastApplied = 0
+	rf.volatile.rand = rand.New(rand.NewSource(time.Now().UnixNano() + int64(os.Getpid())))
+	rf.volatile.nextDelayMs = rf.volatile.rand.Int31n(150) + 500
+
+	rf.volatileLeader.nextIndex = make([]int32, len(peers))
+	rf.volatileLeader.matchIndex = make([]int32, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
