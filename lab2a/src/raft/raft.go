@@ -44,6 +44,14 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type RaftState int
+
+const (
+	Leader RaftState = iota
+	Follower
+	Candidate
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -57,26 +65,29 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm    int32
-	votedFor       int8
+	currentTerm    int
+	votedFor       int
 	log            []Log
 	volatile       Volatile
 	volatileLeader VolatileLeader
 }
 
 type Volatile struct {
-	commitIndex int32
-	lastApplied int32
-	nextDelayMs int32
-	raftState   RaftState
+	commitIndex   int
+	lastApplied   int
+	electionTimer *time.Timer
+	raftState     RaftState
+	rand          *rand.Rand
+	leaderId      int
 }
 
 type VolatileLeader struct {
-	nextIndex  []int32
-	matchIndex []int32
+	nextIndex  []int
+	matchIndex []int
 }
 
 type Log struct {
+	term int
 }
 
 // return currentTerm and whether this server
@@ -132,6 +143,67 @@ func (rf *Raft) readPersist(data []byte) {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.resetElection()
+
+	// termIsStale := args.Term < rf.currentTerm
+	termIsNewer := args.Term > rf.currentTerm
+	alreadyVoted := args.Term == rf.currentTerm && args.CandidateId == rf.votedFor
+
+	if termIsNewer || alreadyVoted {
+
+		lastLogIdx := len(rf.log) - 1
+		lastLogTerm := rf.log[lastLogIdx].term
+
+		candidateLogTermIsGreater := args.LastLogTerm > lastLogTerm
+		candidateLogTermIsEqual := args.LastLogTerm == lastLogTerm
+		candidateLogIndexIsGTE := args.LastLogIndex >= lastLogIdx
+
+		candidateLogIsUpToDate :=
+			candidateLogTermIsGreater ||
+				(candidateLogTermIsEqual && candidateLogIndexIsGTE)
+
+		if candidateLogIsUpToDate {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			rf.volatile.raftState = Follower
+		}
+		reply = &RequestVoteReply{
+			Term:        rf.currentTerm,
+			VoteGranted: candidateLogIsUpToDate,
+		}
+	} else {
+		reply = &RequestVoteReply{
+			Term:        rf.currentTerm,
+			VoteGranted: false,
+		}
+	}
+
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if len(args.Entries) > 0 {
+		panic("Phase 2A: Should not be receiving log entries yet")
+	}
+
+	rf.resetElection()
+
+	if args.Term < rf.currentTerm {
+		reply = &AppendEntriesReply{
+			Term:    rf.currentTerm,
+			Success: false,
+		}
+	} else {
+		rf.volatile.leaderId = args.LeaderId
+		rf.currentTerm = args.Term
+	}
+
 }
 
 //
@@ -168,9 +240,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
 // agreement and return immediately. there is no guarantee that this
 // command will ever be committed to the Raft log, since the leader
@@ -234,17 +310,124 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.log = make([]Log, 1)
+	rf.log[0] = Log{
+		term: 0,
+	}
 
 	rf.volatile.commitIndex = 0
 	rf.volatile.lastApplied = 0
-	rf.volatile.rand = rand.New(rand.NewSource(time.Now().UnixNano() + int64(os.Getpid())))
-	rf.volatile.nextDelayMs = rf.volatile.rand.Int31n(150) + 500
+	seed := time.Now().UnixNano() + int64(os.Getpid())
+	rf.volatile.rand = rand.New(rand.NewSource(seed))
+	rf.volatile.raftState = Candidate
+	rf.volatile.leaderId = -1
 
-	rf.volatileLeader.nextIndex = make([]int32, len(peers))
-	rf.volatileLeader.matchIndex = make([]int32, len(peers))
+	rf.volatileLeader.nextIndex = make([]int, len(peers))
+	rf.volatileLeader.matchIndex = make([]int, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.resetElection()
+
+	go (func() {
+		time.Sleep(time.Duration(10) * time.Millisecond)
+		if rf.killed() {
+			return
+		}
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if rf.volatile.raftState == Leader {
+
+		}
+
+	})()
+
 	return rf
+}
+
+func (rf *Raft) resetElection() {
+
+
+	if rf.volatile.electionTimer != nil && !rf.volatile.electionTimer.Stop() {
+		<-rf.volatile.electionTimer.C
+	}
+
+	triggerElection := func() {
+		rf.resetElection()
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm += 1
+		rf.votedFor = rf.me
+
+		lastLogIdx := len(rf.log) - 1
+		req := RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: lastLogIdx,
+			LastLogTerm:  rf.log[lastLogIdx].term,
+		}
+		wg := sync.WaitGroup{}
+
+		resps := make([]RequestVoteReply, len(rf.peers))
+		failures := make([]bool, len(rf.peers))
+
+		for i, _ := range rf.peers {
+			if i != rf.me {
+				wg.Add(1)
+				defer wg.Done()
+				completed := make(chan struct{})
+
+				go (func() {
+					defer close(completed)
+					failures[i] = rf.sendRequestVote(i, &req, &resps[i])
+				})()
+				select {
+				case <-completed:
+
+				case <-time.After(time.Duration(100) * time.Millisecond):
+					failures[i] = true
+				}
+			}
+		}
+
+		wg.Wait()
+
+		votes := 1
+		highestDisagreeingTerm := 0
+		for i, r := range resps {
+			if i != rf.me && !failures[i] {
+				if r.VoteGranted {
+					votes += 1
+				} else {
+					highestDisagreeingTerm =
+						max(highestDisagreeingTerm, r.Term)
+				}
+			}
+		}
+
+		if votes >= (len(rf.peers)/2)+1 {
+			rf.volatile.raftState = Leader
+		} else {
+			rf.currentTerm = highestDisagreeingTerm
+			rf.volatile.raftState = Follower
+		}
+	}
+
+	nextElectionTrigger :=
+		time.Duration(rf.volatile.rand.Intn(250)+400) *
+			time.Millisecond
+
+	if !rf.killed() {
+		rf.volatile.electionTimer = time.AfterFunc(nextElectionTrigger, triggerElection)
+	}
+}
+
+func max(x, y int) int {
+	if x > y {
+		return x
+	} else {
+		return y
+	}
 }
