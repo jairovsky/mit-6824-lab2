@@ -33,3 +33,7 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 }
+
+type Log struct {
+	Term int
+}

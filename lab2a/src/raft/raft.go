@@ -23,6 +23,9 @@ import "../labrpc"
 import "math/rand"
 import "os"
 import "time"
+import "log"
+import "encoding/binary"
+import "io/ioutil"
 
 // import "bytes"
 // import "../labgob"
@@ -86,10 +89,6 @@ type VolatileLeader struct {
 	matchIndex []int
 }
 
-type Log struct {
-	term int
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -97,6 +96,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.volatile.raftState == Leader
+
 	return term, isleader
 }
 
@@ -141,7 +146,7 @@ func (rf *Raft) readPersist(data []byte) {
 //
 // example RequestVote RPC handler.
 //
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 	// Your code here (2A, 2B).
 
 	rf.mu.Lock()
@@ -149,14 +154,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.resetElection()
 
+	// r := RequestVoteReply{}
+
+	log.Printf("%d received RequestVote from %d\n", rf.me, args.CandidateId)
+
 	// termIsStale := args.Term < rf.currentTerm
 	termIsNewer := args.Term > rf.currentTerm
 	alreadyVoted := args.Term == rf.currentTerm && args.CandidateId == rf.votedFor
 
+	log.Printf("%d termIsNewer=%t alreadyVoted=%t", rf.me, termIsNewer, alreadyVoted)
 	if termIsNewer || alreadyVoted {
 
 		lastLogIdx := len(rf.log) - 1
-		lastLogTerm := rf.log[lastLogIdx].term
+		lastLogTerm := rf.log[lastLogIdx].Term
 
 		candidateLogTermIsGreater := args.LastLogTerm > lastLogTerm
 		candidateLogTermIsEqual := args.LastLogTerm == lastLogTerm
@@ -171,37 +181,50 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			rf.volatile.raftState = Follower
 		}
-		reply = &RequestVoteReply{
+
+		log.Printf("%d candidateLogIsUpToDate=%t ", rf.me, candidateLogIsUpToDate)
+
+		*reply = &RequestVoteReply{
 			Term:        rf.currentTerm,
 			VoteGranted: candidateLogIsUpToDate,
 		}
 	} else {
-		reply = &RequestVoteReply{
+		*reply = &RequestVoteReply{
 			Term:        rf.currentTerm,
 			VoteGranted: false,
 		}
 	}
 
+	// reply.Term = r.Term
+	// reply.VoteGranted = r.VoteGranted
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesReply) {
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	rf.resetElection()
 
 	if len(args.Entries) > 0 {
 		panic("Phase 2A: Should not be receiving log entries yet")
 	}
 
-	rf.resetElection()
+	log.Printf("%d receives AppendEntries from %d", rf.me, args.LeaderId)
 
 	if args.Term < rf.currentTerm {
-		reply = &AppendEntriesReply{
+		*reply = &AppendEntriesReply{
 			Term:    rf.currentTerm,
 			Success: false,
 		}
 	} else {
 		rf.volatile.leaderId = args.LeaderId
+		rf.volatile.raftState = Follower
 		rf.currentTerm = args.Term
+		*reply = &AppendEntriesReply{
+			Term:    rf.currentTerm,
+			Success: true,
+		}
 	}
 
 }
@@ -308,16 +331,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+
+	logLevel := os.Getenv("LOG_LEVEL")
+	if logLevel == "DISABLE" {
+		log.SetOutput(ioutil.Discard)
+	}
+
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]Log, 1)
 	rf.log[0] = Log{
-		term: 0,
+		Term: 0,
 	}
 
 	rf.volatile.commitIndex = 0
 	rf.volatile.lastApplied = 0
-	seed := time.Now().UnixNano() + int64(os.Getpid())
+	seed := randomInt64FromSystem()
+	log.Printf("seed %d\n", seed)
 	rf.volatile.rand = rand.New(rand.NewSource(seed))
 	rf.volatile.raftState = Candidate
 	rf.volatile.leaderId = -1
@@ -329,17 +359,86 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.resetElection()
+	log.Println("initial election timer set")
 
 	go (func() {
-		time.Sleep(time.Duration(10) * time.Millisecond)
-		if rf.killed() {
-			return
-		}
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+		for {
 
-		if rf.volatile.raftState == Leader {
+			time.Sleep(time.Duration(20) * time.Millisecond)
+			if rf.killed() {
+				return
+			}
 
+			rf.mu.Lock()
+			if rf.volatile.raftState != Leader {
+				rf.mu.Unlock()
+				continue
+			}
+
+			log.Printf("%d looping heartbeat", rf.me)
+
+			rf.resetElection()
+
+			prevLogIdx := len(rf.log) - 1
+			req := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIdx,
+				PrevLogTerm:  rf.log[prevLogIdx].Term,
+				Entries:      make([]Log, 0),
+				LeaderCommit: rf.volatile.commitIndex,
+			}
+			wg := sync.WaitGroup{}
+			resps := make([]AppendEntriesReply, len(rf.peers))
+			successes := make([]bool, len(rf.peers))
+
+			for i, _ := range rf.peers {
+				if i != rf.me {
+					wg.Add(1)
+
+					completed := make(chan bool)
+
+					icopy := i
+
+					go (func() {
+						log.Printf("%d sends AppendEntries to %d\n", rf.me, icopy)
+						ok := rf.sendAppendEntries(icopy, &req, &resps[icopy])
+						completed <- ok
+						close(completed)
+					})()
+					go (func() {
+						defer wg.Done()
+						select {
+						case ok := <-completed:
+							log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
+							successes[icopy] = ok
+						case <-time.After(time.Duration(50) * time.Millisecond):
+							log.Printf("request timed out %d -> %d\n", rf.me, icopy)
+							successes[icopy] = false
+						}
+					})()
+				}
+			}
+
+			wg.Wait()
+
+			highestDisagreeingTerm := -1
+			for i, r := range resps {
+				if i != rf.me && successes[i] {
+					log.Printf("%d response from %d %v", rf.me, i, r)
+					if !r.Success {
+						highestDisagreeingTerm =
+							max(highestDisagreeingTerm, r.Term)
+					}
+				}
+			}
+
+			if highestDisagreeingTerm > -1 {
+				rf.currentTerm = highestDisagreeingTerm
+				rf.volatile.raftState = Follower
+			}
+
+			rf.mu.Unlock()
 		}
 
 	})()
@@ -349,15 +448,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) resetElection() {
 
+	log.Printf("%d will reset timer", rf.me)
 
-	if rf.volatile.electionTimer != nil && !rf.volatile.electionTimer.Stop() {
-		<-rf.volatile.electionTimer.C
+	if rf.volatile.electionTimer != nil {
+		rf.volatile.electionTimer.Stop()
 	}
 
 	triggerElection := func() {
-		rf.resetElection()
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		log.Printf("%d trigger election", rf.me)
 		rf.currentTerm += 1
 		rf.votedFor = rf.me
 
@@ -366,38 +466,49 @@ func (rf *Raft) resetElection() {
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
 			LastLogIndex: lastLogIdx,
-			LastLogTerm:  rf.log[lastLogIdx].term,
+			LastLogTerm:  rf.log[lastLogIdx].Term,
 		}
 		wg := sync.WaitGroup{}
 
 		resps := make([]RequestVoteReply, len(rf.peers))
-		failures := make([]bool, len(rf.peers))
+		successes := make([]bool, len(rf.peers))
 
 		for i, _ := range rf.peers {
 			if i != rf.me {
 				wg.Add(1)
-				defer wg.Done()
-				completed := make(chan struct{})
+
+				completed := make(chan bool)
+
+				icopy := i
 
 				go (func() {
-					defer close(completed)
-					failures[i] = rf.sendRequestVote(i, &req, &resps[i])
+					log.Printf("%d sends RequestVote to %d\n", rf.me, icopy)
+					ok := rf.sendRequestVote(icopy, &req, &resps[icopy])
+					completed <- ok
+					close(completed)
 				})()
-				select {
-				case <-completed:
-
-				case <-time.After(time.Duration(100) * time.Millisecond):
-					failures[i] = true
-				}
+				go (func() {
+					defer wg.Done()
+					select {
+					case ok := <-completed:
+						log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
+						successes[icopy] = ok
+					case <-time.After(time.Duration(50) * time.Millisecond):
+						log.Printf("request timed out %d -> %d\n", rf.me, icopy)
+						successes[icopy] = false
+					}
+				})()
 			}
 		}
 
 		wg.Wait()
+		log.Println("requests ended")
 
 		votes := 1
-		highestDisagreeingTerm := 0
+		highestDisagreeingTerm := -1
 		for i, r := range resps {
-			if i != rf.me && !failures[i] {
+			if i != rf.me && successes[i] {
+				log.Printf("%d response from %d %v", rf.me, i, r)
 				if r.VoteGranted {
 					votes += 1
 				} else {
@@ -409,17 +520,24 @@ func (rf *Raft) resetElection() {
 
 		if votes >= (len(rf.peers)/2)+1 {
 			rf.volatile.raftState = Leader
+			log.Printf("\x1b[0;92m%d im leader\x1b[0;0m", rf.me)
 		} else {
-			rf.currentTerm = highestDisagreeingTerm
-			rf.volatile.raftState = Follower
+			if highestDisagreeingTerm > -1 {
+				rf.currentTerm = highestDisagreeingTerm
+				rf.volatile.raftState = Follower
+				log.Printf("%d im not leader votes=%d highestDisagreeingTerm=%d", rf.me, votes, highestDisagreeingTerm)
+			}
 		}
+
+		rf.resetElection()
 	}
 
 	nextElectionTrigger :=
-		time.Duration(rf.volatile.rand.Intn(250)+400) *
+		time.Duration(rf.volatile.rand.Intn(500)+300) *
 			time.Millisecond
 
 	if !rf.killed() {
+		log.Printf("%d resetting election timer to %v\n", rf.me, nextElectionTrigger)
 		rf.volatile.electionTimer = time.AfterFunc(nextElectionTrigger, triggerElection)
 	}
 }
@@ -430,4 +548,20 @@ func max(x, y int) int {
 	} else {
 		return y
 	}
+}
+
+func randomInt64FromSystem() int64 {
+
+	f, err := os.Open("/dev/urandom")
+	if err != nil {
+		log.Fatalf("error opening file %v", err)
+	}
+
+	var result int64
+	err = binary.Read(f, binary.LittleEndian, &result)
+	if err != nil {
+		log.Fatalf("error reading bytes %v", err)
+	}
+
+	return result
 }
