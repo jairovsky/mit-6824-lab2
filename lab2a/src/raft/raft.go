@@ -162,8 +162,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 	log.Printf("%d termIsNewer=%t alreadyVoted=%t", rf.me, termIsNewer, alreadyVoted)
 	if termIsNewer || alreadyVoted {
 
-		lastLogIdx := len(rf.log) - 1
-		lastLogTerm := rf.log[lastLogIdx].Term
+		lastLogIdx, lastLogTerm := rf.lastLogIndexAndTerm()
 
 		candidateLogTermIsGreater := args.LastLogTerm > lastLogTerm
 		candidateLogTermIsEqual := args.LastLogTerm == lastLogTerm
@@ -333,10 +332,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]Log, 1)
-	rf.log[0] = Log{
-		Term: 0,
-	}
+	rf.log = make([]Log, 0)
 
 	rf.volatile.commitIndex = 0
 	rf.volatile.lastApplied = 0
@@ -379,12 +375,12 @@ func (rf *Raft) heartbeatLoop() {
 
 		rf.resetElectionTimer()
 
-		prevLogIdx := len(rf.log) - 1
+		prevLogIdx, prevLogTerm := rf.lastLogIndexAndTerm()
 		req := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIdx,
-			PrevLogTerm:  rf.log[prevLogIdx].Term,
+			PrevLogTerm:  prevLogTerm,
 			Entries:      make([]Log, 0),
 			LeaderCommit: rf.volatile.commitIndex,
 		}
@@ -468,12 +464,13 @@ func (rf *Raft) triggerElection() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 
-	lastLogIdx := len(rf.log) - 1
+	lastLogIdx, lastLogTerm := rf.lastLogIndexAndTerm()
+
 	req := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: lastLogIdx,
-		LastLogTerm:  rf.log[lastLogIdx].Term,
+		LastLogTerm:  lastLogTerm,
 	}
 	wg := sync.WaitGroup{}
 
@@ -536,6 +533,16 @@ func (rf *Raft) triggerElection() {
 	}
 
 	rf.resetElectionTimer()
+}
+
+func (rf *Raft) lastLogIndexAndTerm() (int, int) {
+	lastLogIdx := max(0, len(rf.log) - 1)
+	var lastLogTerm int
+	if len(rf.log) > 0 {
+		lastLogTerm = rf.log[lastLogIdx].Term
+	}
+
+	return lastLogIdx, lastLogTerm
 }
 
 func max(x, y int) int {
