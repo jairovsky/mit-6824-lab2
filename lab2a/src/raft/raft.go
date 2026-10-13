@@ -386,7 +386,7 @@ func (rf *Raft) heartbeatLoop() {
 		}
 		wg := sync.WaitGroup{}
 		resps := make([]AppendEntriesReply, len(rf.peers))
-		requstSuccess := make([]bool, len(rf.peers))
+		requestSuccess := make([]bool, len(rf.peers))
 
 		for i, _ := range rf.peers {
 			if i != rf.me {
@@ -407,10 +407,10 @@ func (rf *Raft) heartbeatLoop() {
 					select {
 					case ok := <-completed:
 						log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
-						requstSuccess[icopy] = ok
+						requestSuccess[icopy] = ok
 					case <-time.After(time.Duration(50) * time.Millisecond):
 						log.Printf("request timed out %d -> %d\n", rf.me, icopy)
-						requstSuccess[icopy] = false
+						requestSuccess[icopy] = false
 					}
 				})()
 			}
@@ -420,7 +420,7 @@ func (rf *Raft) heartbeatLoop() {
 
 		highestDisagreeingTerm := -1
 		for i, r := range resps {
-			if i != rf.me && requstSuccess[i] {
+			if i != rf.me && requestSuccess[i] {
 				log.Printf("%d response from %d %v", rf.me, i, r)
 				if !r.Success {
 					highestDisagreeingTerm =
@@ -536,7 +536,7 @@ func (rf *Raft) triggerElection() {
 }
 
 func (rf *Raft) lastLogIndexAndTerm() (int, int) {
-	lastLogIdx := max(0, len(rf.log) - 1)
+	lastLogIdx := max(0, len(rf.log)-1)
 	var lastLogTerm int
 	if len(rf.log) > 0 {
 		lastLogTerm = rf.log[lastLogIdx].Term
