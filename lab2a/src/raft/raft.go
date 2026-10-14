@@ -388,26 +388,33 @@ func (rf *Raft) heartbeatLoop() {
 		resps := make([]AppendEntriesReply, len(rf.peers))
 		requestSuccess := make([]bool, len(rf.peers))
 
+		type RequestResult struct {
+			ok    bool
+			reply AppendEntriesReply
+		}
+
 		for i, _ := range rf.peers {
 			if i != rf.me {
 				wg.Add(1)
 
-				completed := make(chan bool)
+				completed := make(chan RequestResult)
 
 				icopy := i
 
 				go (func() {
+					reply := AppendEntriesReply{}
 					log.Printf("%d sends AppendEntries to %d\n", rf.me, icopy)
-					ok := rf.sendAppendEntries(icopy, &req, &resps[icopy])
-					completed <- ok
+					ok := rf.sendAppendEntries(icopy, &req, &reply)
+					completed <- RequestResult{ok, reply}
 					close(completed)
 				})()
 				go (func() {
 					defer wg.Done()
 					select {
-					case ok := <-completed:
+					case result := <-completed:
 						log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
-						requestSuccess[icopy] = ok
+						requestSuccess[icopy] = result.ok
+						resps[icopy] = result.reply
 					case <-time.After(time.Duration(50) * time.Millisecond):
 						log.Printf("request timed out %d -> %d\n", rf.me, icopy)
 						requestSuccess[icopy] = false
@@ -477,25 +484,32 @@ func (rf *Raft) triggerElection() {
 	resps := make([]RequestVoteReply, len(rf.peers))
 	requestSuccess := make([]bool, len(rf.peers))
 
+	type RequestResult struct {
+		ok    bool
+		reply RequestVoteReply
+	}
+
 	for i, _ := range rf.peers {
 		if i != rf.me {
 			wg.Add(1)
 
-			completed := make(chan bool)
+			completed := make(chan RequestResult)
 
 			icopy := i
 
 			go (func() {
+				reply := RequestVoteReply{}
 				log.Printf("%d sends RequestVote to %d\n", rf.me, icopy)
-				ok := rf.sendRequestVote(icopy, &req, &resps[icopy])
-				completed <- ok
+				ok := rf.sendRequestVote(icopy, &req, &reply)
+				completed <- RequestResult{ok, reply}
 				close(completed)
 			})()
 			go (func() {
 				defer wg.Done()
 				select {
-				case ok := <-completed:
-					requestSuccess[icopy] = ok
+				case result := <-completed:
+					requestSuccess[icopy] = result.ok
+					resps[icopy] = result.reply
 				case <-time.After(time.Duration(50) * time.Millisecond):
 					log.Printf("request timed out %d -> %d\n", rf.me, icopy)
 					requestSuccess[icopy] = false
