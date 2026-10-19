@@ -24,7 +24,6 @@ import "math/rand"
 import "os"
 import "time"
 import "log"
-import "encoding/binary"
 import "io/ioutil"
 
 // import "bytes"
@@ -46,6 +45,18 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 }
+
+// My implementation makes the effort to treat indexes as 0-based. This helps
+// declaring and reading some variables given Go's 0-value rules, and to
+// reason about the server's state on a fresh installation (server with no logs).
+//
+// However, and as far as I could grasp, the test code provided
+// assumes 1-indexed arrays, meaning the very first log entry on a server has
+// index number 1 and not 0 as most programmers would expect.
+//
+// This constant is used to mark the places where I need to convert indexes
+// to comply with the test code.
+const offset1IndexedArray = 1
 
 type RaftState int
 
@@ -82,6 +93,7 @@ type Volatile struct {
 	raftState     RaftState
 	rand          *rand.Rand
 	leaderId      int
+	applyCh       chan ApplyMsg
 }
 
 type VolatileLeader struct {
@@ -143,9 +155,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-//
-// example RequestVote RPC handler.
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 	// Your code here (2A, 2B).
 
@@ -199,27 +208,67 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 
 	rf.resetElectionTimer()
 
-	if len(args.Entries) > 0 {
-		panic("Phase 2A: Should not be receiving log entries yet")
-	}
+	log.Printf("%d receives AppendEntries from %d %v", rf.me, args.LeaderId, args)
 
-	log.Printf("%d receives AppendEntries from %d", rf.me, args.LeaderId)
+	lastLogIdx, _ := rf.lastLogIndexAndTerm()
+	logConflict := lastLogIdx > -1 &&
+		(args.PrevLogIndex > lastLogIdx ||
+			rf.log[args.PrevLogIndex].Term != args.PrevLogTerm)
+
+	if args.Term > rf.currentTerm {
+		rf.volatile.leaderId = args.LeaderId
+		rf.volatile.raftState = Follower
+		rf.currentTerm = args.Term
+	}
 
 	if args.Term < rf.currentTerm {
 		*reply = &AppendEntriesReply{
 			Term:    rf.currentTerm,
 			Success: false,
 		}
+
+		log.Printf("%d rejected AppendEntries: stale term", rf.me)
+	} else if logConflict {
+		*reply = &AppendEntriesReply{
+			Term:    rf.currentTerm,
+			Success: false,
+			// TODO on log conflict, send extra info so the leader
+			// can rewind the log position for this particular follower
+			// and resend the missing log entries
+			// on later AppendEntries rounds
+		}
+		log.Printf("%d rejected AppendEntries: log conflict", rf.me)
 	} else {
-		rf.volatile.leaderId = args.LeaderId
-		rf.volatile.raftState = Follower
-		rf.currentTerm = args.Term
+		i := args.PrevLogIndex + 1
+		l := len(args.Entries)
+		j := i + l
+		e := 0
+		for i < j && i < len(rf.log) {
+			log.Printf(
+				"%d override log entry index=%d %v with %v",
+				rf.me, i, rf.log[i], args.Entries[e],
+			)
+			rf.log[i] = args.Entries[e]
+			i += 1
+			e += 1
+		}
+		if e < len(args.Entries) {
+			log.Printf("%d appending new entries %v", rf.me, args.Entries[e:])
+			rf.log = append(rf.log, args.Entries[e:]...)
+		}
+		log.Printf("%d log after appending %v %v", rf.me, args.Entries, rf.log)
+
+		if args.LeaderCommit > rf.volatile.commitIndex {
+			rf.volatile.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
+		}
+		rf.applyPending()
+
 		*reply = &AppendEntriesReply{
 			Term:    rf.currentTerm,
 			Success: true,
 		}
+		log.Printf("%d accepted AppendEntries", rf.me)
 	}
-
 }
 
 //
@@ -281,7 +330,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index, term, isLeader = rf.appendCommand(command)
+
+	log.Printf("%d append command %v %t", rf.me, command, isLeader)
+
+	return index + offset1IndexedArray, term, isLeader
+}
+
+func (rf *Raft) appendCommand(command interface{}) (int, int, bool) {
+
+	isLeader := rf.volatile.raftState == Leader
+
+	if !isLeader {
+		return -1, -1, false
+	}
+
+	l := Log{
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+	rf.log = append(rf.log, l)
+
+	return rf.lastLogIndex(), l.Term, isLeader
 }
 
 //
@@ -325,6 +397,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
+	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
 	logLevel := os.Getenv("LOG_LEVEL")
 	if logLevel == "DISABLE" {
 		log.SetOutput(ioutil.Discard)
@@ -334,10 +407,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.log = make([]Log, 0)
 
-	rf.volatile.commitIndex = 0
-	rf.volatile.lastApplied = 0
+	rf.volatile.commitIndex = -1
+	rf.volatile.lastApplied = -1
 	seed := randomInt64FromSystem()
-	log.Printf("seed %d\n", seed)
+	log.Printf("%d seed %d\n", rf.me, seed)
 	rf.volatile.rand = rand.New(rand.NewSource(seed))
 	rf.volatile.raftState = Candidate
 	rf.volatile.leaderId = -1
@@ -345,11 +418,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.volatileLeader.nextIndex = make([]int, len(peers))
 	rf.volatileLeader.matchIndex = make([]int, len(peers))
 
+	rf.volatile.applyCh = applyCh
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.resetElectionTimer()
-	log.Println("initial election timer set")
+	log.Printf("%d initial election timer set", rf.me)
 
 	go rf.heartbeatLoop()
 
@@ -357,6 +432,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 const heartbeatInterval time.Duration = time.Duration(20) * time.Millisecond
+const requestTimeout time.Duration = time.Duration(50) * time.Millisecond
 
 func (rf *Raft) heartbeatLoop() {
 	for {
@@ -373,75 +449,146 @@ func (rf *Raft) heartbeatLoop() {
 
 		log.Printf("%d looping heartbeat", rf.me)
 
-		rf.resetElectionTimer()
-
-		prevLogIdx, prevLogTerm := rf.lastLogIndexAndTerm()
-		req := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIdx,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      make([]Log, 0),
-			LeaderCommit: rf.volatile.commitIndex,
-		}
-		wg := sync.WaitGroup{}
-		resps := make([]AppendEntriesReply, len(rf.peers))
-		requestSuccess := make([]bool, len(rf.peers))
-
-		type RequestResult struct {
-			ok    bool
-			reply AppendEntriesReply
-		}
-
-		for i, _ := range rf.peers {
-			if i != rf.me {
-				wg.Add(1)
-
-				completed := make(chan RequestResult)
-
-				icopy := i
-
-				go (func() {
-					reply := AppendEntriesReply{}
-					log.Printf("%d sends AppendEntries to %d\n", rf.me, icopy)
-					ok := rf.sendAppendEntries(icopy, &req, &reply)
-					completed <- RequestResult{ok, reply}
-					close(completed)
-				})()
-				go (func() {
-					defer wg.Done()
-					select {
-					case result := <-completed:
-						log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
-						requestSuccess[icopy] = result.ok
-						resps[icopy] = result.reply
-					case <-time.After(time.Duration(50) * time.Millisecond):
-						log.Printf("request timed out %d -> %d\n", rf.me, icopy)
-						requestSuccess[icopy] = false
-					}
-				})()
-			}
-		}
-
-		wg.Wait()
-
-		highestDisagreeingTerm := -1
-		for i, r := range resps {
-			if i != rf.me && requestSuccess[i] {
-				log.Printf("%d response from %d %v", rf.me, i, r)
-				if !r.Success {
-					highestDisagreeingTerm =
-						max(highestDisagreeingTerm, r.Term)
-				}
-			}
-		}
-
-		if highestDisagreeingTerm > -1 {
-			rf.currentTerm = highestDisagreeingTerm
-			rf.volatile.raftState = Follower
-		}
+		rf.replicateLogs()
 
 		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) replicateLogs() {
+
+	rf.resetElectionTimer()
+
+	wg := sync.WaitGroup{}
+	resps := make([]AppendEntriesReply, len(rf.peers))
+	requestSuccess := make([]bool, len(rf.peers))
+	logLengthSent := make([]int, len(rf.peers))
+
+	type RequestResult struct {
+		ok    bool
+		reply AppendEntriesReply
+	}
+
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			wg.Add(1)
+
+			completed := make(chan RequestResult)
+
+			icopy := i
+
+			go (func() {
+
+				var prevLogIdx, prevLogTerm int
+				var entries []Log
+				if len(rf.log) > 0 {
+					nextIndex := rf.volatileLeader.nextIndex[icopy]
+					prevLogIdx = nextIndex - 1
+
+					if prevLogIdx == -1 {
+						prevLogIdx = 0
+						prevLogTerm = 0
+					} else {
+						prevLogTerm = rf.log[prevLogIdx].Term
+					}
+					entries = rf.log[nextIndex:]
+					logLengthSent[icopy] = len(entries)
+				}
+				log.Printf("%d entries to send %v", rf.me, entries)
+
+				req := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: prevLogIdx,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					LeaderCommit: rf.volatile.commitIndex,
+				}
+
+				reply := AppendEntriesReply{}
+				log.Printf("%d sends AppendEntries to %d\n", rf.me, icopy)
+				ok := rf.sendAppendEntries(icopy, &req, &reply)
+				completed <- RequestResult{ok, reply}
+				close(completed)
+			})()
+			go (func() {
+				defer wg.Done()
+				select {
+				case result := <-completed:
+					log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
+					requestSuccess[icopy] = result.ok
+					resps[icopy] = result.reply
+				case <-time.After(requestTimeout):
+					log.Printf("request timed out %d -> %d\n", rf.me, icopy)
+					requestSuccess[icopy] = false
+				}
+			})()
+		}
+	}
+
+	wg.Wait()
+
+	agreements := 1
+	highestDisagreeingTerm := -1
+	for i, r := range resps {
+		if i != rf.me && requestSuccess[i] {
+			log.Printf("%d response from %d %v", rf.me, i, r)
+			if !r.Success {
+				highestDisagreeingTerm = max(highestDisagreeingTerm, r.Term)
+				if r.Term == rf.currentTerm {
+					// TODO handle extra data sent by the peer
+					// to rewind the log index faster
+					rf.volatileLeader.nextIndex[i] =
+						max(0, rf.volatileLeader.nextIndex[i]-1)
+					log.Printf("%d rewind nextIndex=%d", rf.me, rf.volatileLeader.nextIndex[i])
+				}
+			} else {
+				agreements += 1
+				rf.volatileLeader.nextIndex[i] += logLengthSent[i]
+				rf.volatileLeader.matchIndex[i] = rf.volatileLeader.nextIndex[i] - 1
+			}
+		}
+	}
+
+	log.Printf("%d agreements=%d", rf.me, agreements)
+
+	if highestDisagreeingTerm > rf.currentTerm {
+		log.Printf("%d stepping down from Leader state", rf.me)
+		rf.currentTerm = highestDisagreeingTerm
+		rf.volatile.raftState = Follower
+	} else {
+		if agreements >= rf.minVotesForQuorum() {
+			for n := rf.volatile.commitIndex + 1; n <= rf.lastLogIndex(); n += 1 {
+				log.Printf("%d matchIndex %v", rf.me, rf.volatileLeader.matchIndex)
+				matches := 1
+				for _, mi := range rf.volatileLeader.matchIndex {
+					if mi >= n && rf.log[n].Term == rf.currentTerm {
+						matches += 1
+					}
+				}
+				if matches >= rf.minVotesForQuorum() {
+					log.Printf("%d commit index update %d", rf.me, n)
+					rf.volatile.commitIndex = n
+				}
+			}
+			rf.applyPending()
+		}
+	}
+}
+
+func (rf *Raft) applyPending() {
+
+	for i := rf.volatile.lastApplied + 1; i <= rf.volatile.commitIndex; i += 1 {
+		l := rf.log[i]
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      l.Command,
+			CommandIndex: i + offset1IndexedArray,
+		}
+		log.Printf("%d sending ApplyMsg %v", rf.me, msg)
+		rf.volatile.applyCh <- msg
+		log.Printf("%d applied", rf.me)
+		rf.volatile.lastApplied = i
 	}
 }
 
@@ -464,6 +611,11 @@ func (rf *Raft) resetElectionTimer() {
 }
 
 func (rf *Raft) triggerElection() {
+
+	if rf.killed() {
+		return
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -510,7 +662,7 @@ func (rf *Raft) triggerElection() {
 				case result := <-completed:
 					requestSuccess[icopy] = result.ok
 					resps[icopy] = result.reply
-				case <-time.After(time.Duration(50) * time.Millisecond):
+				case <-time.After(requestTimeout):
 					log.Printf("request timed out %d -> %d\n", rf.me, icopy)
 					requestSuccess[icopy] = false
 				}
@@ -519,7 +671,7 @@ func (rf *Raft) triggerElection() {
 	}
 
 	wg.Wait()
-	log.Println("RequestVote round ended")
+	log.Printf("%d RequestVote round ended", rf.me)
 
 	votes := 1
 	highestDisagreeingTerm := -1
@@ -535,9 +687,16 @@ func (rf *Raft) triggerElection() {
 		}
 	}
 
-	if votes >= (len(rf.peers)/2)+1 {
+	if votes >= rf.minVotesForQuorum() {
 		rf.volatile.raftState = Leader
-		log.Printf("\x1b[0;92m%d im leader\x1b[0;0m", rf.me)
+		for i, _ := range rf.volatileLeader.nextIndex {
+			rf.volatileLeader.nextIndex[i] = rf.lastLogIndex() + 1
+		}
+		for i, _ := range rf.volatileLeader.matchIndex {
+			rf.volatileLeader.matchIndex[i] = -1
+		}
+		log.Printf("%d im leader", rf.me)
+		log.Printf("%d reset nextIndex to %v ", rf.me, rf.volatileLeader.nextIndex)
 	} else {
 		if highestDisagreeingTerm > -1 {
 			rf.currentTerm = highestDisagreeingTerm
@@ -549,14 +708,23 @@ func (rf *Raft) triggerElection() {
 	rf.resetElectionTimer()
 }
 
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.log) - 1
+}
+
 func (rf *Raft) lastLogIndexAndTerm() (int, int) {
-	lastLogIdx := max(0, len(rf.log)-1)
+	lastLogIdx := rf.lastLogIndex()
 	var lastLogTerm int
 	if len(rf.log) > 0 {
 		lastLogTerm = rf.log[lastLogIdx].Term
 	}
 
 	return lastLogIdx, lastLogTerm
+}
+
+func (rf *Raft) minVotesForQuorum() int {
+
+	return (len(rf.peers) / 2) + 1
 }
 
 func max(x, y int) int {
@@ -567,18 +735,10 @@ func max(x, y int) int {
 	}
 }
 
-func randomInt64FromSystem() int64 {
-
-	f, err := os.Open("/dev/urandom")
-	if err != nil {
-		log.Fatalf("error opening file %v", err)
+func min(x, y int) int {
+	if x < y {
+		return x
+	} else {
+		return y
 	}
-
-	var result int64
-	err = binary.Read(f, binary.LittleEndian, &result)
-	if err != nil {
-		log.Fatalf("error reading bytes %v", err)
-	}
-
-	return result
 }

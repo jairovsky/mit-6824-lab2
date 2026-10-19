@@ -35,5 +35,6 @@ type AppendEntriesReply struct {
 }
 
 type Log struct {
-	Term int
+	Term    int
+	Command interface{}
 }
