@@ -97,8 +97,9 @@ type Volatile struct {
 }
 
 type VolatileLeader struct {
-	nextIndex  []int
-	matchIndex []int
+	nextIndex       []int
+	matchIndex      []int
+	lastInteraction []time.Time
 }
 
 // return currentTerm and whether this server
@@ -417,6 +418,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.volatileLeader.nextIndex = make([]int, len(peers))
 	rf.volatileLeader.matchIndex = make([]int, len(peers))
+	rf.volatileLeader.lastInteraction = make([]time.Time, len(peers))
 
 	rf.volatile.applyCh = applyCh
 
@@ -433,6 +435,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 const heartbeatInterval time.Duration = time.Duration(20) * time.Millisecond
 const requestTimeout time.Duration = time.Duration(50) * time.Millisecond
+const maxIdleInterval time.Duration = time.Duration(100) * time.Millisecond
 
 func (rf *Raft) heartbeatLoop() {
 	for {
@@ -462,9 +465,11 @@ func (rf *Raft) replicateLogs() {
 	wg := sync.WaitGroup{}
 	resps := make([]AppendEntriesReply, len(rf.peers))
 	requestSuccess := make([]bool, len(rf.peers))
-	logLengthSent := make([]int, len(rf.peers))
+	logLengthToSend := make([]int, len(rf.peers))
+	hadInteraction := make([]bool, len(rf.peers))
 
 	type RequestResult struct {
+		sent  bool
 		ok    bool
 		reply AppendEntriesReply
 	}
@@ -492,7 +497,7 @@ func (rf *Raft) replicateLogs() {
 						prevLogTerm = rf.log[prevLogIdx].Term
 					}
 					entries = rf.log[nextIndex:]
-					logLengthSent[icopy] = len(entries)
+					logLengthToSend[icopy] = len(entries)
 				}
 				log.Printf("%d entries to send %v", rf.me, entries)
 
@@ -506,18 +511,36 @@ func (rf *Raft) replicateLogs() {
 				}
 
 				reply := AppendEntriesReply{}
+
+				timeSinceLastInteraction :=
+					time.Now().Sub(rf.volatileLeader.lastInteraction[icopy])
+
+				noEntriesToSend := logLengthToSend[icopy] == 0
+				talkedRecently := timeSinceLastInteraction <= maxIdleInterval
+
+				if noEntriesToSend && talkedRecently {
+					msg := "%d does not need to send AppendEntries to %d"
+					log.Printf(msg, rf.me, icopy)
+					completed <- RequestResult{false, false, reply}
+					close(completed)
+					return
+				}
+
 				log.Printf("%d sends AppendEntries to %d\n", rf.me, icopy)
 				ok := rf.sendAppendEntries(icopy, &req, &reply)
-				completed <- RequestResult{ok, reply}
+				completed <- RequestResult{true, ok, reply}
 				close(completed)
 			})()
 			go (func() {
 				defer wg.Done()
 				select {
 				case result := <-completed:
-					log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
-					requestSuccess[icopy] = result.ok
-					resps[icopy] = result.reply
+					if result.sent {
+						log.Printf("request ended ok %d -> %d\n", rf.me, icopy)
+						requestSuccess[icopy] = result.ok
+						resps[icopy] = result.reply
+					}
+					hadInteraction[icopy] = result.sent
 				case <-time.After(requestTimeout):
 					log.Printf("request timed out %d -> %d\n", rf.me, icopy)
 					requestSuccess[icopy] = false
@@ -527,6 +550,13 @@ func (rf *Raft) replicateLogs() {
 	}
 
 	wg.Wait()
+
+	now := time.Now()
+	for i, _ := range rf.volatileLeader.lastInteraction {
+		if hadInteraction[i] {
+			rf.volatileLeader.lastInteraction[i] = now
+		}
+	}
 
 	agreements := 1
 	highestDisagreeingTerm := -1
@@ -544,7 +574,7 @@ func (rf *Raft) replicateLogs() {
 				}
 			} else {
 				agreements += 1
-				rf.volatileLeader.nextIndex[i] += logLengthSent[i]
+				rf.volatileLeader.nextIndex[i] += logLengthToSend[i]
 				rf.volatileLeader.matchIndex[i] = rf.volatileLeader.nextIndex[i] - 1
 			}
 		}
@@ -695,6 +725,7 @@ func (rf *Raft) triggerElection() {
 		for i, _ := range rf.volatileLeader.matchIndex {
 			rf.volatileLeader.matchIndex[i] = -1
 		}
+		rf.volatileLeader.lastInteraction = make([]time.Time, len(rf.peers))
 		log.Printf("%d im leader", rf.me)
 		log.Printf("%d reset nextIndex to %v ", rf.me, rf.volatileLeader.nextIndex)
 	} else {
