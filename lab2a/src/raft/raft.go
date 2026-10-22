@@ -195,6 +195,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 			VoteGranted: candidateLogIsUpToDate,
 		}
 	} else {
+
+		log.Printf("%d rejected RequestVote from %d", rf.me, args.CandidateId)
+
 		*reply = &RequestVoteReply{
 			Term:        rf.currentTerm,
 			VoteGranted: false,
@@ -204,15 +207,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesReply) {
 
+	log.Printf("%d receives AppendEntries from %d %v", rf.me, args.LeaderId, args)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	rf.resetElectionTimer()
 
-	log.Printf("%d receives AppendEntries from %d %v", rf.me, args.LeaderId, args)
-
 	lastLogIdx, _ := rf.lastLogIndexAndTerm()
-	logConflict := lastLogIdx > -1 &&
+	logConflict := lastLogIdx > -1 && args.PrevLogIndex > -1 &&
 		(args.PrevLogIndex > lastLogIdx ||
 			rf.log[args.PrevLogIndex].Term != args.PrevLogTerm)
 
@@ -229,14 +232,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		}
 
 		log.Printf("%d rejected AppendEntries: stale term", rf.me)
+
 	} else if logConflict {
+
+		firstLogWithTerm := binSearchEarliest(rf.log, args.PrevLogTerm)
+		rewindTo := max(rf.volatile.commitIndex+1, firstLogWithTerm)
 		*reply = &AppendEntriesReply{
-			Term:    rf.currentTerm,
-			Success: false,
-			// TODO on log conflict, send extra info so the leader
-			// can rewind the log position for this particular follower
-			// and resend the missing log entries
-			// on later AppendEntries rounds
+			Term:     rf.currentTerm,
+			Success:  false,
+			RewindTo: rewindTo,
 		}
 		log.Printf("%d rejected AppendEntries: log conflict", rf.me)
 	} else {
@@ -244,15 +248,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		l := len(args.Entries)
 		j := i + l
 		e := 0
+
+		t := time.Now()
+		tt := i < j && i < len(rf.log)
 		for i < j && i < len(rf.log) {
-			log.Printf(
-				"%d override log entry index=%d %v with %v",
-				rf.me, i, rf.log[i], args.Entries[e],
-			)
 			rf.log[i] = args.Entries[e]
 			i += 1
 			e += 1
 		}
+		if tt {
+			log.Printf("%d time spent overriding entries %v", rf.me, time.Now().Sub(t))
+		}
+
 		if e < len(args.Entries) {
 			log.Printf("%d appending new entries %v", rf.me, args.Entries[e:])
 			rf.log = append(rf.log, args.Entries[e:]...)
@@ -478,7 +485,7 @@ func (rf *Raft) replicateLogs() {
 		if i != rf.me {
 			wg.Add(1)
 
-			completed := make(chan RequestResult)
+			completed := make(chan RequestResult, 1)
 
 			icopy := i
 
@@ -491,8 +498,8 @@ func (rf *Raft) replicateLogs() {
 					prevLogIdx = nextIndex - 1
 
 					if prevLogIdx == -1 {
-						prevLogIdx = 0
-						prevLogTerm = 0
+						prevLogIdx = -1
+						prevLogTerm = -1
 					} else {
 						prevLogTerm = rf.log[prevLogIdx].Term
 					}
@@ -566,11 +573,12 @@ func (rf *Raft) replicateLogs() {
 			if !r.Success {
 				highestDisagreeingTerm = max(highestDisagreeingTerm, r.Term)
 				if r.Term == rf.currentTerm {
-					// TODO handle extra data sent by the peer
-					// to rewind the log index faster
+
+					before := rf.volatileLeader.nextIndex[i]
 					rf.volatileLeader.nextIndex[i] =
-						max(0, rf.volatileLeader.nextIndex[i]-1)
-					log.Printf("%d rewind nextIndex=%d", rf.me, rf.volatileLeader.nextIndex[i])
+						max(0, r.RewindTo)
+
+					log.Printf("%d rewind nextIndex %d->%d", rf.me, before, rf.volatileLeader.nextIndex[i])
 				}
 			} else {
 				agreements += 1
@@ -675,7 +683,7 @@ func (rf *Raft) triggerElection() {
 		if i != rf.me {
 			wg.Add(1)
 
-			completed := make(chan RequestResult)
+			completed := make(chan RequestResult, 1)
 
 			icopy := i
 

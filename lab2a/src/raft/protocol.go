@@ -30,8 +30,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term     int
+	Success  bool
+	RewindTo int
 }
 
 type Log struct {
