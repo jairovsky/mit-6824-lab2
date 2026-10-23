@@ -214,7 +214,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 
 	rf.resetElectionTimer()
 
-	lastLogIdx, _ := rf.lastLogIndexAndTerm()
+	lastLogIdx := rf.lastLogIndex()
 	logConflict := lastLogIdx > -1 && args.PrevLogIndex > -1 &&
 		(args.PrevLogIndex > lastLogIdx ||
 			rf.log[args.PrevLogIndex].Term != args.PrevLogTerm)
@@ -250,14 +250,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		e := 0
 
 		t := time.Now()
-		tt := i < j && i < len(rf.log)
+		didOverride := false
 		for i < j && i < len(rf.log) {
 			rf.log[i] = args.Entries[e]
 			i += 1
 			e += 1
+			didOverride = true
 		}
-		if tt {
-			log.Printf("%d time spent overriding entries %v", rf.me, time.Now().Sub(t))
+		if didOverride {
+			log.Printf("%d time spent overriding entries %v", rf.me, time.Since(t))
 		}
 
 		if e < len(args.Entries) {
@@ -520,7 +521,7 @@ func (rf *Raft) replicateLogs() {
 				reply := AppendEntriesReply{}
 
 				timeSinceLastInteraction :=
-					time.Now().Sub(rf.volatileLeader.lastInteraction[icopy])
+					time.Since(rf.volatileLeader.lastInteraction[icopy])
 
 				noEntriesToSend := logLengthToSend[icopy] == 0
 				talkedRecently := timeSinceLastInteraction <= maxIdleInterval
