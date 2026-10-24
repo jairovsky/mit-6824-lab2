@@ -26,8 +26,8 @@ import "time"
 import "log"
 import "io/ioutil"
 
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -130,13 +130,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.durable.currentTerm)
+	e.Encode(rf.durable.votedFor)
+	e.Encode(rf.durable.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -147,18 +147,22 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var err error = nil
+
+	err = d.Decode(&rf.durable.currentTerm)
+	if err != nil {
+	  log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
+	}
+	err = d.Decode(&rf.durable.votedFor)
+	if err != nil {
+	  log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
+	}
+	err = d.Decode(&rf.durable.log)
+	if err != nil {
+	  log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
+	}
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
@@ -191,6 +195,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 			rf.durable.currentTerm = args.Term
 			rf.durable.votedFor = args.CandidateId
 			rf.volatile.raftState = Follower
+			rf.persist()
 		}
 
 		log.Printf("%d candidateLogIsUpToDate=%t ", rf.me, candidateLogIsUpToDate)
@@ -224,10 +229,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		(args.PrevLogIndex > lastLogIdx ||
 			rf.durable.log[args.PrevLogIndex].Term != args.PrevLogTerm)
 
+	changedState := false
+	defer func() {
+		if changedState {
+			rf.persist()
+		}
+	}()
+
 	if args.Term > rf.durable.currentTerm {
 		rf.volatile.leaderId = args.LeaderId
 		rf.volatile.raftState = Follower
 		rf.durable.currentTerm = args.Term
+		changedState = true
 	}
 
 	if args.Term < rf.durable.currentTerm {
@@ -261,6 +274,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 			i += 1
 			e += 1
 			didOverride = true
+			changedState = true
 		}
 		if didOverride {
 			log.Printf("%d time spent overriding entries %v", rf.me, time.Since(t))
@@ -269,6 +283,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		if e < len(args.Entries) {
 			log.Printf("%d appending new entries %v", rf.me, args.Entries[e:])
 			rf.durable.log = append(rf.durable.log, args.Entries[e:]...)
+			changedState = true
 		}
 		log.Printf("%d log after appending %v %v", rf.me, args.Entries, rf.durable.log)
 
@@ -366,6 +381,7 @@ func (rf *Raft) appendCommand(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.durable.log = append(rf.durable.log, l)
+	rf.persist()
 
 	return rf.lastLogIndex(), l.Term, isLeader
 }
@@ -416,10 +432,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	if logLevel == "DISABLE" {
 		log.SetOutput(ioutil.Discard)
 	}
-
-	rf.durable.currentTerm = 0
-	rf.durable.votedFor = -1
-	rf.durable.log = make([]Log, 0)
 
 	rf.volatile.commitIndex = -1
 	rf.volatile.lastApplied = -1
@@ -600,6 +612,7 @@ func (rf *Raft) replicateLogs() {
 		log.Printf("%d stepping down from Leader state", rf.me)
 		rf.durable.currentTerm = highestDisagreeingTerm
 		rf.volatile.raftState = Follower
+		rf.persist()
 	} else {
 		if agreements >= rf.minVotesForQuorum() {
 			for n := rf.volatile.commitIndex + 1; n <= rf.lastLogIndex(); n += 1 {
@@ -666,6 +679,7 @@ func (rf *Raft) triggerElection() {
 	log.Printf("%d trigger election", rf.me)
 	rf.durable.currentTerm += 1
 	rf.durable.votedFor = rf.me
+	rf.persist()
 
 	lastLogIdx, lastLogTerm := rf.lastLogIndexAndTerm()
 
@@ -747,6 +761,7 @@ func (rf *Raft) triggerElection() {
 			rf.durable.currentTerm = highestDisagreeingTerm
 			rf.volatile.raftState = Follower
 			log.Printf("%d im not leader votes=%d highestDisagreeingTerm=%d", rf.me, votes, highestDisagreeingTerm)
+			rf.persist()
 		}
 	}
 
