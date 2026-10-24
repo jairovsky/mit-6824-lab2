@@ -117,7 +117,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term = rf.currentTerm
+	term = rf.durable.currentTerm
 	isleader = rf.volatile.raftState == Leader
 
 	return term, isleader
@@ -171,8 +171,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 
 	log.Printf("%d received RequestVote from %d\n", rf.me, args.CandidateId)
 
-	termIsNewer := args.Term > rf.currentTerm
-	alreadyVoted := args.Term == rf.currentTerm && args.CandidateId == rf.votedFor
+	termIsNewer := args.Term > rf.durable.currentTerm
+	alreadyVoted := args.Term == rf.durable.currentTerm && args.CandidateId == rf.durable.votedFor
 
 	log.Printf("%d termIsNewer=%t alreadyVoted=%t", rf.me, termIsNewer, alreadyVoted)
 	if termIsNewer || alreadyVoted {
@@ -188,15 +188,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 				(candidateLogTermIsEqual && candidateLogIndexIsGTE)
 
 		if candidateLogIsUpToDate {
-			rf.currentTerm = args.Term
-			rf.votedFor = args.CandidateId
+			rf.durable.currentTerm = args.Term
+			rf.durable.votedFor = args.CandidateId
 			rf.volatile.raftState = Follower
 		}
 
 		log.Printf("%d candidateLogIsUpToDate=%t ", rf.me, candidateLogIsUpToDate)
 
 		*reply = &RequestVoteReply{
-			Term:        rf.currentTerm,
+			Term:        rf.durable.currentTerm,
 			VoteGranted: candidateLogIsUpToDate,
 		}
 	} else {
@@ -204,7 +204,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 		log.Printf("%d rejected RequestVote from %d", rf.me, args.CandidateId)
 
 		*reply = &RequestVoteReply{
-			Term:        rf.currentTerm,
+			Term:        rf.durable.currentTerm,
 			VoteGranted: false,
 		}
 	}
@@ -222,17 +222,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 	lastLogIdx := rf.lastLogIndex()
 	logConflict := lastLogIdx > -1 && args.PrevLogIndex > -1 &&
 		(args.PrevLogIndex > lastLogIdx ||
-			rf.log[args.PrevLogIndex].Term != args.PrevLogTerm)
+			rf.durable.log[args.PrevLogIndex].Term != args.PrevLogTerm)
 
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.durable.currentTerm {
 		rf.volatile.leaderId = args.LeaderId
 		rf.volatile.raftState = Follower
-		rf.currentTerm = args.Term
+		rf.durable.currentTerm = args.Term
 	}
 
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.durable.currentTerm {
 		*reply = &AppendEntriesReply{
-			Term:    rf.currentTerm,
+			Term:    rf.durable.currentTerm,
 			Success: false,
 		}
 
@@ -240,10 +240,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 
 	} else if logConflict {
 
-		firstLogWithTerm := binSearchEarliest(rf.log, args.PrevLogTerm)
+		firstLogWithTerm := binSearchEarliest(rf.durable.log, args.PrevLogTerm)
 		rewindTo := max(rf.volatile.commitIndex+1, firstLogWithTerm)
 		*reply = &AppendEntriesReply{
-			Term:     rf.currentTerm,
+			Term:     rf.durable.currentTerm,
 			Success:  false,
 			RewindTo: rewindTo,
 		}
@@ -256,8 +256,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 
 		t := time.Now()
 		didOverride := false
-		for i < j && i < len(rf.log) {
-			rf.log[i] = args.Entries[e]
+		for i < j && i < len(rf.durable.log) {
+			rf.durable.log[i] = args.Entries[e]
 			i += 1
 			e += 1
 			didOverride = true
@@ -268,9 +268,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 
 		if e < len(args.Entries) {
 			log.Printf("%d appending new entries %v", rf.me, args.Entries[e:])
-			rf.log = append(rf.log, args.Entries[e:]...)
+			rf.durable.log = append(rf.durable.log, args.Entries[e:]...)
 		}
-		log.Printf("%d log after appending %v %v", rf.me, args.Entries, rf.log)
+		log.Printf("%d log after appending %v %v", rf.me, args.Entries, rf.durable.log)
 
 		if args.LeaderCommit > rf.volatile.commitIndex {
 			rf.volatile.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
@@ -278,7 +278,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		rf.applyPending()
 
 		*reply = &AppendEntriesReply{
-			Term:    rf.currentTerm,
+			Term:    rf.durable.currentTerm,
 			Success: true,
 		}
 		log.Printf("%d accepted AppendEntries", rf.me)
@@ -362,10 +362,10 @@ func (rf *Raft) appendCommand(command interface{}) (int, int, bool) {
 	}
 
 	l := Log{
-		Term:    rf.currentTerm,
+		Term:    rf.durable.currentTerm,
 		Command: command,
 	}
-	rf.log = append(rf.log, l)
+	rf.durable.log = append(rf.durable.log, l)
 
 	return rf.lastLogIndex(), l.Term, isLeader
 }
@@ -417,9 +417,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		log.SetOutput(ioutil.Discard)
 	}
 
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.log = make([]Log, 0)
+	rf.durable.currentTerm = 0
+	rf.durable.votedFor = -1
+	rf.durable.log = make([]Log, 0)
 
 	rf.volatile.commitIndex = -1
 	rf.volatile.lastApplied = -1
@@ -499,7 +499,7 @@ func (rf *Raft) replicateLogs() {
 
 				var prevLogIdx, prevLogTerm int
 				var entries []Log
-				if len(rf.log) > 0 {
+				if len(rf.durable.log) > 0 {
 					nextIndex := rf.volatileLeader.nextIndex[icopy]
 					prevLogIdx = nextIndex - 1
 
@@ -507,15 +507,15 @@ func (rf *Raft) replicateLogs() {
 						prevLogIdx = -1
 						prevLogTerm = -1
 					} else {
-						prevLogTerm = rf.log[prevLogIdx].Term
+						prevLogTerm = rf.durable.log[prevLogIdx].Term
 					}
-					entries = rf.log[nextIndex:]
+					entries = rf.durable.log[nextIndex:]
 					logLengthToSend[icopy] = len(entries)
 				}
 				log.Printf("%d entries to send %v", rf.me, entries)
 
 				req := AppendEntriesArgs{
-					Term:         rf.currentTerm,
+					Term:         rf.durable.currentTerm,
 					LeaderId:     rf.me,
 					PrevLogIndex: prevLogIdx,
 					PrevLogTerm:  prevLogTerm,
@@ -578,7 +578,7 @@ func (rf *Raft) replicateLogs() {
 			log.Printf("%d response from %d %v", rf.me, i, r)
 			if !r.Success {
 				highestDisagreeingTerm = max(highestDisagreeingTerm, r.Term)
-				if r.Term == rf.currentTerm {
+				if r.Term == rf.durable.currentTerm {
 
 					before := rf.volatileLeader.nextIndex[i]
 					rf.volatileLeader.nextIndex[i] =
@@ -596,9 +596,9 @@ func (rf *Raft) replicateLogs() {
 
 	log.Printf("%d agreements=%d", rf.me, agreements)
 
-	if highestDisagreeingTerm > rf.currentTerm {
+	if highestDisagreeingTerm > rf.durable.currentTerm {
 		log.Printf("%d stepping down from Leader state", rf.me)
-		rf.currentTerm = highestDisagreeingTerm
+		rf.durable.currentTerm = highestDisagreeingTerm
 		rf.volatile.raftState = Follower
 	} else {
 		if agreements >= rf.minVotesForQuorum() {
@@ -606,7 +606,7 @@ func (rf *Raft) replicateLogs() {
 				log.Printf("%d matchIndex %v", rf.me, rf.volatileLeader.matchIndex)
 				matches := 1
 				for _, mi := range rf.volatileLeader.matchIndex {
-					if mi >= n && rf.log[n].Term == rf.currentTerm {
+					if mi >= n && rf.durable.log[n].Term == rf.durable.currentTerm {
 						matches += 1
 					}
 				}
@@ -623,7 +623,7 @@ func (rf *Raft) replicateLogs() {
 func (rf *Raft) applyPending() {
 
 	for i := rf.volatile.lastApplied + 1; i <= rf.volatile.commitIndex; i += 1 {
-		l := rf.log[i]
+		l := rf.durable.log[i]
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      l.Command,
@@ -664,13 +664,13 @@ func (rf *Raft) triggerElection() {
 	defer rf.mu.Unlock()
 
 	log.Printf("%d trigger election", rf.me)
-	rf.currentTerm += 1
-	rf.votedFor = rf.me
+	rf.durable.currentTerm += 1
+	rf.durable.votedFor = rf.me
 
 	lastLogIdx, lastLogTerm := rf.lastLogIndexAndTerm()
 
 	req := RequestVoteArgs{
-		Term:         rf.currentTerm,
+		Term:         rf.durable.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: lastLogIdx,
 		LastLogTerm:  lastLogTerm,
@@ -744,7 +744,7 @@ func (rf *Raft) triggerElection() {
 		log.Printf("%d reset nextIndex to %v ", rf.me, rf.volatileLeader.nextIndex)
 	} else {
 		if highestDisagreeingTerm > -1 {
-			rf.currentTerm = highestDisagreeingTerm
+			rf.durable.currentTerm = highestDisagreeingTerm
 			rf.volatile.raftState = Follower
 			log.Printf("%d im not leader votes=%d highestDisagreeingTerm=%d", rf.me, votes, highestDisagreeingTerm)
 		}
@@ -754,14 +754,14 @@ func (rf *Raft) triggerElection() {
 }
 
 func (rf *Raft) lastLogIndex() int {
-	return len(rf.log) - 1
+	return len(rf.durable.log) - 1
 }
 
 func (rf *Raft) lastLogIndexAndTerm() (int, int) {
 	lastLogIdx := rf.lastLogIndex()
 	var lastLogTerm int
-	if len(rf.log) > 0 {
-		lastLogTerm = rf.log[lastLogIdx].Term
+	if len(rf.durable.log) > 0 {
+		lastLogTerm = rf.durable.log[lastLogIdx].Term
 	}
 
 	return lastLogIdx, lastLogTerm
