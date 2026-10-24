@@ -79,11 +79,10 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm    int
-	votedFor       int
-	log            []Log
+	
 	volatile       Volatile
 	volatileLeader VolatileLeader
+	durable        Durable
 }
 
 type Volatile struct {
@@ -100,6 +99,12 @@ type VolatileLeader struct {
 	nextIndex       []int
 	matchIndex      []int
 	lastInteraction []time.Time
+}
+
+type Durable struct {
+	currentTerm    int
+	votedFor       int
+	log            []Log
 }
 
 // return currentTerm and whether this server
