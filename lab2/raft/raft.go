@@ -262,27 +262,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		}
 		log.Printf("%d rejected AppendEntries: log conflict", rf.me)
 	} else {
-		i := args.PrevLogIndex + 1
-		l := len(args.Entries)
-		j := i + l
-		e := 0
 
-		t := time.Now()
-		didOverride := false
-		for i < j && i < len(rf.durable.log) {
-			rf.durable.log[i] = args.Entries[e]
-			i += 1
-			e += 1
-			didOverride = true
+		indexToWrite := args.PrevLogIndex + 1
+		notEndOfLog := indexToWrite < len(rf.durable.log)
+
+		if notEndOfLog {
+			// Prunes old entries that are on the end of the slice
+			// but were not overriden.
+			// This is necessary to prevent incorrect log size
+			// on future rounds of RequestVote.
+			rf.durable.log = rf.durable.log[:indexToWrite]
 			changedState = true
 		}
-		if didOverride {
-			log.Printf("%d time spent overriding entries %v", rf.me, time.Since(t))
-		}
 
-		if e < len(args.Entries) {
-			log.Printf("%d appending new entries %v", rf.me, args.Entries[e:])
-			rf.durable.log = append(rf.durable.log, args.Entries[e:]...)
+		if len(args.Entries) > 0 {
+			log.Printf("%d appending new entries %v", rf.me, args.Entries)
+			rf.durable.log = append(rf.durable.log, args.Entries...)
 			changedState = true
 		}
 		log.Printf("%d log after appending %v %v", rf.me, args.Entries, rf.durable.log)
@@ -594,7 +589,7 @@ func (rf *Raft) replicateLogs() {
 
 					before := rf.volatileLeader.nextIndex[i]
 					rf.volatileLeader.nextIndex[i] =
-						max(0, r.RewindTo)
+						min(max(0, r.RewindTo), rf.lastLogIndex()+1)
 
 					log.Printf("%d rewind nextIndex %d->%d", rf.me, before, rf.volatileLeader.nextIndex[i])
 				}
