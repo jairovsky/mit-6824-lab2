@@ -18,25 +18,29 @@ func TestBinSearch(t *testing.T) {
 		Log{4, 0},
 	}
 
-	if binSearchEarliest(l, 99) != -1 {
+	highUpperIndex := 99_000_000
+
+	if binSearchEarliest(l, -99, highUpperIndex) != -1 {
 		t.Errorf("inexistent entry")
 	}
 
-	if binSearchEarliest(l, -99) != -1 {
-		t.Errorf("inexistent entry")
-	}
-
-	x := binSearchEarliest(l, 1)
+	x := binSearchEarliest(l, 1, highUpperIndex)
 	if x != 3 {
 		t.Errorf("entry with term 1 is not on index %d", x)
 	}
 
-	x = binSearchEarliest(l, 4)
+	x = binSearchEarliest(l, 4, 5)
+	if x != 4 {
+		t.Errorf("entry with term 4 is past index 5, "+
+			"should return index 4 but returned %d", x)
+	}
+
+	x = binSearchEarliest(l, 4, highUpperIndex)
 	if x != 6 {
 		t.Errorf("entry with term 4 is not on index %d", x)
 	}
 
-	if binSearchEarliest(l, 3) != 4 {
+	if binSearchEarliest(l, 3, highUpperIndex) != 4 {
 		t.Errorf("inexistent term 3 should return earliest index of term 2")
 	}
 
@@ -56,15 +60,15 @@ func TestBinSearch(t *testing.T) {
 		i += 1
 	}
 
-	x = binSearchEarliest(l2, 33)
+	x = binSearchEarliest(l2, 33, highUpperIndex)
 	if x != 10 {
 		t.Errorf("entry with term 33 is not on index %d", x)
 	}
-	x = binSearchEarliest(l2, 34)
+	x = binSearchEarliest(l2, 34, highUpperIndex)
 	if x != 10 {
 		t.Error("inexistent term 34 should return earliest index of term 33", x)
 	}
-	x = binSearchEarliest(l2, 99)
+	x = binSearchEarliest(l2, 99, highUpperIndex)
 	if x != large-10 {
 		t.Errorf("entry with term 99 is not on index %d", large-10)
 	}

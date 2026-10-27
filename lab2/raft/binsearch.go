@@ -4,13 +4,12 @@ package raft
 // If no term T exists in the logs, it will find the first
 // log entry that has the highest term less than T
 // If T is less than the lowest term in then logs, returns -1
-// If T is greater than the highest term in then logs, returns -1
-func binSearchEarliest(logs []Log, t int) int {
+func binSearchEarliest(logs []Log, t int, upperIndex int) int {
 
 	i := 0
-	j := len(logs) - 1
+	j := min(len(logs)-1, max(0, upperIndex))
 
-	if t < logs[i].Term || t > logs[j].Term {
+	if t < logs[i].Term {
 		return -1
 	}
 
@@ -27,7 +26,7 @@ func binSearchEarliest(logs []Log, t int) int {
 			// didn't find any entry with term t
 			// try the preceding term number
 			// which is guaranteed to exist
-			return binSearchEarliest(logs, logs[i].Term)
+			return binSearchEarliest(logs, logs[i].Term, upperIndex)
 		}
 		if t <= logs[m].Term {
 			j = m

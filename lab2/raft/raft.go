@@ -253,8 +253,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 
 	} else if logConflict {
 
-		firstLogWithTerm := binSearchEarliest(rf.durable.log, args.PrevLogTerm)
-		rewindTo := max(rf.volatile.commitIndex+1, firstLogWithTerm)
+		rewindTo := binSearchEarliest(rf.durable.log, args.PrevLogTerm, args.PrevLogIndex)
+		rewindTo = max(rf.volatile.lastApplied+1, rewindTo)
 		*reply = &AppendEntriesReply{
 			Term:     rf.durable.currentTerm,
 			Success:  false,
