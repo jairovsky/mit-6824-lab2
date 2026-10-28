@@ -20,6 +20,10 @@ func TestBinSearch(t *testing.T) {
 
 	highUpperIndex := 99_000_000
 
+	if binSearchEarliest([]Log{}, 99, highUpperIndex) != -1 {
+		t.Errorf("empty log")
+	}
+
 	if binSearchEarliest(l, -99, highUpperIndex) != -1 {
 		t.Errorf("inexistent entry")
 	}

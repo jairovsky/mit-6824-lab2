@@ -223,8 +223,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 	defer rf.mu.Unlock()
 
 	lastLogIdx := rf.lastLogIndex()
-	logConflict := lastLogIdx > -1 && args.PrevLogIndex > -1 &&
-		(args.PrevLogIndex > lastLogIdx ||
+	logConflict := args.PrevLogIndex > lastLogIdx ||
+		(args.PrevLogIndex > -1 &&
 			rf.durable.log[args.PrevLogIndex].Term != args.PrevLogTerm)
 
 	changedState := false

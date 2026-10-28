@@ -6,6 +6,10 @@ package raft
 // If T is less than the lowest term in then logs, returns -1
 func binSearchEarliest(logs []Log, t int, upperIndex int) int {
 
+	if len(logs) == 0 {
+		return -1
+	}
+
 	i := 0
 	j := min(len(logs)-1, max(0, upperIndex))
 
