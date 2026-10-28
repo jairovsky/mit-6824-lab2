@@ -79,7 +79,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	
+
 	volatile       Volatile
 	volatileLeader VolatileLeader
 	durable        Durable
@@ -99,12 +99,13 @@ type VolatileLeader struct {
 	nextIndex       []int
 	matchIndex      []int
 	lastInteraction []time.Time
+	failedRounds    []int
 }
 
 type Durable struct {
-	currentTerm    int
-	votedFor       int
-	log            []Log
+	currentTerm int
+	votedFor    int
+	log         []Log
 }
 
 // return currentTerm and whether this server
@@ -153,15 +154,15 @@ func (rf *Raft) readPersist(data []byte) {
 
 	err = d.Decode(&rf.durable.currentTerm)
 	if err != nil {
-	  log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
+		log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
 	}
 	err = d.Decode(&rf.durable.votedFor)
 	if err != nil {
-	  log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
+		log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
 	}
 	err = d.Decode(&rf.durable.log)
 	if err != nil {
-	  log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
+		log.Fatalf("%d couldn't recover durable state: %v", rf.me, err)
 	}
 }
 
@@ -170,8 +171,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	rf.resetElectionTimer()
 
 	log.Printf("%d received RequestVote from %d\n", rf.me, args.CandidateId)
 
@@ -192,6 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply **RequestVoteReply) {
 				(candidateLogTermIsEqual && candidateLogIndexIsGTE)
 
 		if candidateLogIsUpToDate {
+			rf.resetElectionTimer(0)
 			rf.durable.currentTerm = args.Term
 			rf.durable.votedFor = args.CandidateId
 			rf.volatile.raftState = Follower
@@ -222,8 +222,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.resetElectionTimer()
-
 	lastLogIdx := rf.lastLogIndex()
 	logConflict := lastLogIdx > -1 && args.PrevLogIndex > -1 &&
 		(args.PrevLogIndex > lastLogIdx ||
@@ -253,6 +251,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 
 	} else if logConflict {
 
+		rf.resetElectionTimer(0)
+
 		rewindTo := binSearchEarliest(rf.durable.log, args.PrevLogTerm, args.PrevLogIndex)
 		rewindTo = max(rf.volatile.lastApplied+1, rewindTo)
 		*reply = &AppendEntriesReply{
@@ -262,6 +262,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply **AppendEntriesRepl
 		}
 		log.Printf("%d rejected AppendEntries: log conflict", rf.me)
 	} else {
+
+		rf.resetElectionTimer(0)
 
 		indexToWrite := args.PrevLogIndex + 1
 		notEndOfLog := indexToWrite < len(rf.durable.log)
@@ -439,13 +441,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.volatileLeader.nextIndex = make([]int, len(peers))
 	rf.volatileLeader.matchIndex = make([]int, len(peers))
 	rf.volatileLeader.lastInteraction = make([]time.Time, len(peers))
+	rf.volatileLeader.failedRounds = make([]int, len(peers))
 
 	rf.volatile.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.resetElectionTimer()
+	rf.resetElectionTimer(0)
 	log.Printf("%d initial election timer set", rf.me)
 
 	go rf.heartbeatLoop()
@@ -454,8 +457,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 const heartbeatInterval time.Duration = time.Duration(5) * time.Millisecond
-const requestTimeout time.Duration = time.Duration(50) * time.Millisecond
-const maxIdleInterval time.Duration = time.Duration(50) * time.Millisecond
+const requestTimeout time.Duration = time.Duration(10) * time.Millisecond
+const maxIdleInterval time.Duration = time.Duration(30) * time.Millisecond
 
 func (rf *Raft) heartbeatLoop() {
 	for {
@@ -475,7 +478,7 @@ func (rf *Raft) replicateLogs() {
 		rf.mu.Unlock()
 		return
 	}
-	rf.resetElectionTimer()
+	rf.resetElectionTimer(0)
 
 	log.Printf("%d looping heartbeat", rf.me)
 
@@ -588,8 +591,16 @@ func (rf *Raft) replicateLogs() {
 
 	agreements := 1
 	highestDisagreeingTerm := -1
+	unreachablePeers := 0
 	for i, r := range resps {
+		if i != rf.me && !requestSuccess[i] {
+			rf.volatileLeader.failedRounds[i] += 1
+			if rf.volatileLeader.failedRounds[i] > 10 {
+				unreachablePeers += 1
+			}
+		}
 		if i != rf.me && requestSuccess[i] {
+			rf.volatileLeader.failedRounds[i] = 0
 			log.Printf("%d response from %d %v", rf.me, i, r)
 			if !r.Success {
 				highestDisagreeingTerm = max(highestDisagreeingTerm, r.Term)
@@ -610,6 +621,13 @@ func (rf *Raft) replicateLogs() {
 	}
 
 	log.Printf("%d agreements=%d", rf.me, agreements)
+
+	if unreachablePeers >= rf.minVotesForQuorum() {
+		log.Printf("%d detected network partition. Stepping down from Leader state", rf.me)
+		rf.volatile.raftState = Follower
+		rf.persist()
+		return
+	}
 
 	if highestDisagreeingTerm > rf.durable.currentTerm {
 		log.Printf("%d stepping down from Leader state", rf.me)
@@ -650,7 +668,7 @@ func (rf *Raft) applyPending() {
 	}
 }
 
-func (rf *Raft) resetElectionTimer() {
+func (rf *Raft) resetElectionTimer(priority int) {
 
 	log.Printf("%d will reset timer", rf.me)
 
@@ -659,16 +677,16 @@ func (rf *Raft) resetElectionTimer() {
 	}
 
 	nextElectionTrigger :=
-		time.Duration(rf.volatile.rand.Intn(80)+100) *
+		time.Duration(rf.volatile.rand.Intn(80)+100+priority) *
 			time.Millisecond
 
 	if !rf.killed() {
-		rf.volatile.electionTimer = time.AfterFunc(nextElectionTrigger, rf.triggerElection)
+		rf.volatile.electionTimer = time.AfterFunc(nextElectionTrigger, func() { rf.triggerElection(true, 0) })
 		log.Printf("%d election timer reset to %v\n", rf.me, nextElectionTrigger)
 	}
 }
 
-func (rf *Raft) triggerElection() {
+func (rf *Raft) triggerElection(increaseTerm bool, attempt int) {
 
 	if rf.killed() {
 		return
@@ -678,7 +696,9 @@ func (rf *Raft) triggerElection() {
 
 	log.Printf("%d trigger election", rf.me)
 	rf.volatile.raftState = Candidate
-	rf.durable.currentTerm += 1
+	if increaseTerm {
+		rf.durable.currentTerm += 1
+	}
 	rf.durable.votedFor = rf.me
 	rf.persist()
 
@@ -744,7 +764,11 @@ func (rf *Raft) triggerElection() {
 
 	votes := 1
 	highestDisagreeingTerm := -1
+	failedReqs := 0
 	for i, r := range resps {
+		if i != rf.me && !requestSuccess[i] {
+			failedReqs += 1
+		}
 		if i != rf.me && requestSuccess[i] {
 			log.Printf("%d response from %d %v", rf.me, i, r)
 			if r.VoteGranted {
@@ -756,6 +780,16 @@ func (rf *Raft) triggerElection() {
 		}
 	}
 
+	if failedReqs >= rf.minVotesForQuorum() {
+		if attempt > 10 {
+			log.Printf("%d detected network partition. Delaying RequestVote", rf.me)
+			rf.resetElectionTimer(1000)
+			return
+		}
+		go rf.triggerElection(false, attempt+1)
+		return
+	}
+
 	if votes >= rf.minVotesForQuorum() {
 		rf.volatile.raftState = Leader
 		for i, _ := range rf.volatileLeader.nextIndex {
@@ -765,6 +799,7 @@ func (rf *Raft) triggerElection() {
 			rf.volatileLeader.matchIndex[i] = -1
 		}
 		rf.volatileLeader.lastInteraction = make([]time.Time, len(rf.peers))
+		rf.volatileLeader.failedRounds = make([]int, len(rf.peers))
 		log.Printf("%d im leader", rf.me)
 		log.Printf("%d reset nextIndex to %v ", rf.me, rf.volatileLeader.nextIndex)
 	} else {
@@ -776,7 +811,7 @@ func (rf *Raft) triggerElection() {
 		}
 	}
 
-	rf.resetElectionTimer()
+	rf.resetElectionTimer(0)
 }
 
 func (rf *Raft) lastLogIndex() int {
