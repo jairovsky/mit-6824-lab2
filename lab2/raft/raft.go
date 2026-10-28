@@ -453,9 +453,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-const heartbeatInterval time.Duration = time.Duration(20) * time.Millisecond
+const heartbeatInterval time.Duration = time.Duration(5) * time.Millisecond
 const requestTimeout time.Duration = time.Duration(50) * time.Millisecond
-const maxIdleInterval time.Duration = time.Duration(100) * time.Millisecond
+const maxIdleInterval time.Duration = time.Duration(50) * time.Millisecond
 
 func (rf *Raft) heartbeatLoop() {
 	for {
@@ -464,25 +464,23 @@ func (rf *Raft) heartbeatLoop() {
 			return
 		}
 
-		rf.mu.Lock()
-		if rf.volatile.raftState != Leader {
-			rf.mu.Unlock()
-			continue
-		}
-
-		log.Printf("%d looping heartbeat", rf.me)
-
 		rf.replicateLogs()
-
-		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) replicateLogs() {
 
+	rf.mu.Lock()
+	if rf.volatile.raftState != Leader {
+		rf.mu.Unlock()
+		return
+	}
 	rf.resetElectionTimer()
 
+	log.Printf("%d looping heartbeat", rf.me)
+
 	wg := sync.WaitGroup{}
+	reqs := make([]AppendEntriesArgs, len(rf.peers))
 	resps := make([]AppendEntriesReply, len(rf.peers))
 	requestSuccess := make([]bool, len(rf.peers))
 	logLengthToSend := make([]int, len(rf.peers))
@@ -502,33 +500,34 @@ func (rf *Raft) replicateLogs() {
 
 			icopy := i
 
+			var prevLogIdx, prevLogTerm int
+			var entries []Log
+			if len(rf.durable.log) > 0 {
+				nextIndex := rf.volatileLeader.nextIndex[icopy]
+				prevLogIdx = nextIndex - 1
+
+				if prevLogIdx == -1 {
+					prevLogIdx = -1
+					prevLogTerm = -1
+				} else {
+					prevLogTerm = rf.durable.log[prevLogIdx].Term
+				}
+				entries = make([]Log, len(rf.durable.log[nextIndex:]))
+				copy(entries, rf.durable.log[nextIndex:])
+				logLengthToSend[icopy] = len(entries)
+			}
+			log.Printf("%d entries to send %v", rf.me, entries)
+
+			reqs[icopy] = AppendEntriesArgs{
+				Term:         rf.durable.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIdx,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.volatile.commitIndex,
+			}
+
 			go (func() {
-
-				var prevLogIdx, prevLogTerm int
-				var entries []Log
-				if len(rf.durable.log) > 0 {
-					nextIndex := rf.volatileLeader.nextIndex[icopy]
-					prevLogIdx = nextIndex - 1
-
-					if prevLogIdx == -1 {
-						prevLogIdx = -1
-						prevLogTerm = -1
-					} else {
-						prevLogTerm = rf.durable.log[prevLogIdx].Term
-					}
-					entries = rf.durable.log[nextIndex:]
-					logLengthToSend[icopy] = len(entries)
-				}
-				log.Printf("%d entries to send %v", rf.me, entries)
-
-				req := AppendEntriesArgs{
-					Term:         rf.durable.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevLogIdx,
-					PrevLogTerm:  prevLogTerm,
-					Entries:      entries,
-					LeaderCommit: rf.volatile.commitIndex,
-				}
 
 				reply := AppendEntriesReply{}
 
@@ -547,7 +546,7 @@ func (rf *Raft) replicateLogs() {
 				}
 
 				log.Printf("%d sends AppendEntries to %d\n", rf.me, icopy)
-				ok := rf.sendAppendEntries(icopy, &req, &reply)
+				ok := rf.sendAppendEntries(icopy, &reqs[icopy], &reply)
 				completed <- RequestResult{true, ok, reply}
 				close(completed)
 			})()
@@ -569,7 +568,16 @@ func (rf *Raft) replicateLogs() {
 		}
 	}
 
+	rf.mu.Unlock()
+
 	wg.Wait()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.volatile.raftState != Leader {
+		return
+	}
 
 	now := time.Now()
 	for i, _ := range rf.volatileLeader.lastInteraction {
@@ -609,22 +617,20 @@ func (rf *Raft) replicateLogs() {
 		rf.volatile.raftState = Follower
 		rf.persist()
 	} else {
-		if agreements >= rf.minVotesForQuorum() {
-			for n := rf.volatile.commitIndex + 1; n <= rf.lastLogIndex(); n += 1 {
-				log.Printf("%d matchIndex %v", rf.me, rf.volatileLeader.matchIndex)
-				matches := 1
-				for _, mi := range rf.volatileLeader.matchIndex {
-					if mi >= n && rf.durable.log[n].Term == rf.durable.currentTerm {
-						matches += 1
-					}
-				}
-				if matches >= rf.minVotesForQuorum() {
-					log.Printf("%d commit index update %d", rf.me, n)
-					rf.volatile.commitIndex = n
+		log.Printf("%d matchIndex %v", rf.me, rf.volatileLeader.matchIndex)
+		for n := rf.volatile.commitIndex + 1; n <= rf.lastLogIndex(); n += 1 {
+			matches := 1
+			for _, mi := range rf.volatileLeader.matchIndex {
+				if mi >= n && rf.durable.log[n].Term == rf.durable.currentTerm {
+					matches += 1
 				}
 			}
-			rf.applyPending()
+			if matches >= rf.minVotesForQuorum() {
+				log.Printf("%d commit index update %d", rf.me, n)
+				rf.volatile.commitIndex = n
+			}
 		}
+		rf.applyPending()
 	}
 }
 
@@ -653,7 +659,7 @@ func (rf *Raft) resetElectionTimer() {
 	}
 
 	nextElectionTrigger :=
-		time.Duration(rf.volatile.rand.Intn(500)+300) *
+		time.Duration(rf.volatile.rand.Intn(80)+100) *
 			time.Millisecond
 
 	if !rf.killed() {
@@ -669,9 +675,9 @@ func (rf *Raft) triggerElection() {
 	}
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	log.Printf("%d trigger election", rf.me)
+	rf.volatile.raftState = Candidate
 	rf.durable.currentTerm += 1
 	rf.durable.votedFor = rf.me
 	rf.persist()
@@ -723,7 +729,17 @@ func (rf *Raft) triggerElection() {
 		}
 	}
 
+	rf.mu.Unlock()
+
 	wg.Wait()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.volatile.raftState != Candidate {
+		return
+	}
+
 	log.Printf("%d RequestVote round ended", rf.me)
 
 	votes := 1
